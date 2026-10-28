@@ -414,3 +414,229 @@ static int evaluate(char *buf, size_t len, OutBuf *out) {
     free(p.stack);
     return 0;
 }
+static char *join_path(const char *a, const char *b) {
+    size_t la = strlen(a), lb = strlen(b);
+    char *s = malloc(la + lb + 2);
+    if (!s) return NULL;
+    memcpy(s, a, la);
+    size_t k = la;
+    if (la > 0 && a[la - 1] != '/') s[k++] = '/';
+    memcpy(s + k, b, lb + 1);
+    return s;
+}
+
+static char *base_name(const char *path, int strip_txt) {
+    size_t len = strlen(path);
+    while (len > 1 && path[len - 1] == '/') len--;
+    size_t start = len;
+    while (start > 0 && path[start - 1] != '/') start--;
+    size_t n = len - start;
+
+    if ((n == 1 && path[start] == '.') || (n == 2 && path[start] == '.' && path[start + 1] == '.')) {
+        char *real = realpath(path, NULL);
+        if (real) {
+            char *r = base_name(real, strip_txt);
+            free(real);
+            return r;
+        }
+    }
+
+    char *s = malloc(n + 1);
+    if (!s) return NULL;
+    memcpy(s, path + start, n);
+    s[n] = '\0';
+    if (strip_txt && n > 4 && strcmp(s + n - 4, ".txt") == 0) s[n - 4] = '\0';
+    return s;
+}
+
+static int ensure_dir(const char *path) {
+    struct stat st;
+    if (stat(path, &st) == 0) {
+        if (S_ISDIR(st.st_mode)) return 0;
+        fprintf(stderr, "calc: %s exists and is not a directory\n", path);
+        return -1;
+    }
+    if (mkdir(path, 0777) != 0 && errno != EEXIST) {
+        fprintf(stderr, "calc: cannot create %s: %s\n", path, strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+static int process_file(const char *in_path, const char *out_dir) {
+    size_t len = 0;
+    char *buf = read_file(in_path, &len);
+    if (!buf) {
+        fprintf(stderr, "calc: cannot read %s: %s\n", in_path, strerror(errno));
+        return 1;
+    }
+
+    OutBuf out = {NULL, 0, 0};
+    if (evaluate(buf, len, &out)) {
+        fprintf(stderr, "calc: out of memory on %s\n", in_path);
+        free(buf);
+        free(out.data);
+        return 1;
+    }
+    free(buf);
+
+    char *base = base_name(in_path, 1);
+    size_t fl = (base ? strlen(base) : 0) + sizeof FIRST_NAME + sizeof LAST_NAME + sizeof STUDENT_ID + 8;
+    char *fname = malloc(fl);
+    char *out_path = NULL;
+    
+    if (base && fname) {
+        snprintf(fname, fl, "%s_%s_%s_%s.txt", base, FIRST_NAME, LAST_NAME, STUDENT_ID);
+        out_path = join_path(out_dir, fname);
+    }
+    free(base);
+    free(fname);
+    
+    if (!out_path) {
+        fprintf(stderr, "calc: out of memory\n");
+        free(out.data);
+        return 1;
+    }
+
+    int rc = 0;
+    FILE *f = fopen(out_path, "wb");
+    if (!f) {
+        fprintf(stderr, "calc: cannot write %s: %s\n", out_path, strerror(errno));
+        rc = 1;
+    } else {
+        if (out.len && fwrite(out.data, 1, out.len, f) != out.len) rc = 1;
+        if (fclose(f) != 0) rc = 1;
+        if (rc) fprintf(stderr, "calc: error writing %s\n", out_path);
+    }
+    
+    free(out_path);
+    free(out.data);
+    return rc;
+}
+
+static char *default_out_dir(const char *input, int strip_txt) {
+    char *base = base_name(input, strip_txt);
+    if (!base) return NULL;
+    size_t n = strlen(base) + sizeof FIRST_NAME + sizeof STUDENT_ID + 4;
+    char *s = malloc(n);
+    if (s) snprintf(s, n, "%s_%s_%s", base, FIRST_NAME, STUDENT_ID);
+    free(base);
+    return s;
+}
+
+static int ends_with_txt(const char *name) {
+    size_t n = strlen(name);
+    return n > 4 && strcmp(name + n - 4, ".txt") == 0;
+}
+
+static int run_dir(const char *dir, const char *out_dir) {
+    DIR *d = opendir(dir);
+    if (!d) {
+        fprintf(stderr, "calc: cannot open folder %s: %s\n", dir, strerror(errno));
+        return 1;
+    }
+    int rc = 0;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (e->d_name[0] == '.' || !ends_with_txt(e->d_name)) continue;
+        
+        char *path = join_path(dir, e->d_name);
+        if (!path) { rc = 1; break; }
+        
+        struct stat st;
+        if (stat(path, &st) == 0 && S_ISREG(st.st_mode)) {
+            rc |= process_file(path, out_dir);
+        }
+        free(path);
+    }
+    closedir(d);
+    return rc;
+}
+
+static void usage(void) {
+    fprintf(stderr, "usage: calc [-d DIR | --dir DIR] [-o OUTDIR | --output-dir OUTDIR] [input.txt]\n");
+}
+
+static int take_opt(int argc, char **argv, int *i, const char *s, const char *l, const char **val) {
+    const char *a = argv[*i];
+    size_t ll = strlen(l);
+    if (strncmp(a, l, ll) == 0 && a[ll] == '=') {
+        *val = a + ll + 1;
+        return 1;
+    }
+    if (strcmp(a, s) != 0 && strcmp(a, l) != 0) return 0;
+    if (*i + 1 >= argc) return -1;
+    *val = argv[++*i];
+    return 1;
+}
+
+int main(int argc, char **argv) {
+    const char *dir = NULL, *out_dir = NULL, *input = NULL;
+
+    for (int i = 1; i < argc; i++) {
+        int r = take_opt(argc, argv, &i, "-d", "--dir", &dir);
+        if (r == 0) r = take_opt(argc, argv, &i, "-o", "--output-dir", &out_dir);
+        if (r < 0) {
+            fprintf(stderr, "calc: option %s needs a value\n", argv[i]);
+            usage();
+            return 2;
+        }
+        if (r > 0) continue;
+        
+        if (argv[i][0] == '-' && argv[i][1] != '\0') {
+            fprintf(stderr, "calc: unknown option %s\n", argv[i]);
+            usage();
+            return 2;
+        }
+        if (input) {
+            fprintf(stderr, "calc: only one input file is allowed\n");
+            usage();
+            return 2;
+        }
+        input = argv[i];
+    }
+
+    if (!dir && !input) {
+        fprintf(stderr, "calc: no input file or folder given\n");
+        usage();
+        return 2;
+    }
+    if (dir && input) {
+        fprintf(stderr, "calc: give either -d DIR or an input file\n");
+        usage();
+        return 2;
+    }
+
+    struct stat st;
+    const char *src = dir ? dir : input;
+    if (stat(src, &st) != 0) {
+        fprintf(stderr, "calc: %s: %s\n", src, strerror(errno));
+        return 1;
+    }
+    if (dir && !S_ISDIR(st.st_mode)) {
+        fprintf(stderr, "calc: %s is not a folder\n", dir);
+        return 1;
+    }
+    if (!dir && !S_ISREG(st.st_mode)) {
+        fprintf(stderr, "calc: %s is not a regular file\n", input);
+        return 1;
+    }
+
+    char *def = NULL;
+    if (!out_dir) {
+        def = default_out_dir(src, dir == NULL);
+        if (!def) {
+            fprintf(stderr, "calc: out of memory\n");
+            return 1;
+        }
+        out_dir = def;
+    }
+
+    int rc = 1;
+    if (ensure_dir(out_dir) == 0) {
+        rc = dir ? run_dir(dir, out_dir) : process_file(input, out_dir);
+    }
+    free(def);
+    
+    return rc ? 1 : 0;
+}
