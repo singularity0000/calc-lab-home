@@ -318,3 +318,99 @@ static Value parse_expr(Parser *p) {
     }
     return v;
 }
+static int out_append(OutBuf *o, const char *s, size_t n) {
+    if (o->len + n > o->cap) {
+        size_t ncap = o->cap ? o->cap : 4096;
+        while (o->len + n > ncap) ncap *= 2;
+        char *nd = realloc(o->data, ncap);
+        if (!nd) return -1;
+        o->data = nd;
+        o->cap = ncap;
+    }
+    memcpy(o->data + o->len, s, n);
+    o->len += n;
+    return 0;
+}
+
+// How I handle large files: Instead of reading the file line by line (which is slow),
+// I just use fread to dump the whole file into one big memory buffer. 
+// Then, the tokenizer just moves an index through this buffer. No string copying happens 
+// at all for the lines. For the output, I also use a dynamic buffer that grows, 
+// so we don't write to the disk a million times.
+static char *read_file(const char *path, size_t *out_len) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    size_t cap = 1 << 16, len = 0;
+    char *buf = malloc(cap);
+    if (!buf) { fclose(f); return NULL; }
+    
+    for (;;) {
+        if (len + 1 >= cap) {
+            char *nb = realloc(buf, cap * 2);
+            if (!nb) { free(buf); fclose(f); return NULL; }
+            buf = nb;
+            cap *= 2;
+        }
+        size_t got = fread(buf + len, 1, cap - 1 - len, f);
+        len += got;
+        if (got == 0) break;
+    }
+    
+    int bad = ferror(f);
+    fclose(f);
+    if (bad) { free(buf); return NULL; }
+    buf[len] = '\0';
+    *out_len = len;
+    return buf;
+}
+
+static int evaluate(char *buf, size_t len, OutBuf *out) {
+    Parser p;
+    memset(&p, 0, sizeof p);
+    p.buf = buf;
+
+    size_t line = 0;
+    while (line < len) {
+        const char *nl = memchr(buf + line, '\n', len - line);
+        size_t end = nl ? (size_t)(nl - buf) : len;
+
+        size_t i = line;
+        while (i < end && (buf[i] == ' ' || buf[i] == '\t')) i++;
+        
+        // Skip empty lines and comments. The characters still count for positions.
+        if (i < end && buf[i] != '#') {
+            p.pos = line;
+            p.end = end;
+            next(&p);
+            Value v = parse_expr(&p);
+            
+            // If there's an extra ')' or something weird after the expression, it's an error.
+            if (!p.err && p.tok.kind != T_EOL) {
+                fail(&p, p.tok.start);
+            }
+            if (p.err) break;
+
+            char tmp[64];
+            int n = v.is_float ? snprintf(tmp, sizeof tmp, "%.15g\n", v.f)
+                               : snprintf(tmp, sizeof tmp, "%lld\n", v.i);
+            if (out_append(out, tmp, (size_t)n)) {
+                free(p.stack);
+                return -1;
+            }
+        }
+        line = end + 1;
+    }
+
+    // If there's any error, clear the buffer and write ONLY the first error.
+    if (p.err) {
+        char tmp[64];
+        int n = snprintf(tmp, sizeof tmp, "ERROR:%zu\n", p.err);
+        out->len = 0;
+        if (out_append(out, tmp, (size_t)n)) {
+            free(p.stack);
+            return -1;
+        }
+    }
+    free(p.stack);
+    return 0;
+}
